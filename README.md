@@ -1,47 +1,114 @@
-# QuickDrop Rider Payout Dispute Desk
+# QuickDrop Rider Payout Desk
 
-An auditable, deterministic service for resolving QuickDrop rider payout complaints. It accepts the messaging vendor contract, keeps idempotent conversation traces, checks the supplied trip/payout exports, reconciles corrections against PaySwift, and queues anything requiring ops review.
+QuickDrop receives rider messages about missing or incorrect payouts. This service checks each complaint against trip and payout exports, calculates the correct amount using the payout policy, pays small verified corrections through PaySwift, and sends larger or unclear cases to operations.
 
-## Run
+The design is deliberately conservative. The message parser extracts dates, order IDs, and complaint signals; it cannot approve payments or invent financial facts. Authorization, calculations, payment limits, and escalation decisions are handled by Python code.
 
-Local Python 3.11+: `python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt && uvicorn app.main:app --reload`. Set `PAYSWIFT_BASE_URL` (default `http://localhost:8081`); `.env.example` lists all variables. With Docker: `docker compose up --build`.
+## Features
 
-Run tests with `pytest -q`. Run the evaluator against a running service with `python evals/run.py http://localhost:8000`.
+- Handles the messaging vendor's `POST /messages` contract.
+- Preserves conversation context and ignores duplicate message deliveries.
+- Prevents a rider from accessing another rider's orders.
+- Checks trip status, distance, surge, incentives, cancellation penalties, and payout lines.
+- Calculates corrections with Decimal and half-up rounding.
+- Pays up to ₹200 per rider per day through PaySwift.
+- Queues larger corrections and uncertain cases for operations.
+- Provides audit traces and a small operations page at `/ops`.
 
-## Design
+## Request flow
 
 ```mermaid
 flowchart LR
-  W[WhatsApp vendor] --> API[POST /messages]
-  API --> ID[message idempotency + rider authorization]
-  ID --> P[bounded complaint parser]
-  P --> D[deterministic investigation]
-  D --> E[(CSV exports)]
-  D --> R{confirmed correction?}
-  R -->|<= daily cap| PS[PaySwift with idempotency key]
-  R -->|over cap| O[(ops pending approval)]
-  R -->|unclear/failure| X[(ops escalation)]
-  API --> T[(trace store)]
+    M[Messaging vendor] --> API[POST /messages]
+    API --> V[Validate rider and message]
+    V --> C[Extract complaint details]
+    C --> Q[Query trip and payout exports]
+    Q --> R[Reconcile using policy]
+    R -->|within limit| P[PaySwift correction]
+    R -->|large or repeated| A[Ops approval]
+    R -->|unclear or suspicious| E[Ops escalation]
+    API --> T[Trace and idempotency store]
 ```
 
-The parser only extracts dates, order IDs, and complaint signals. It never decides ownership, amounts, approval, or payment. `calculator.py` implements the policy using Decimal/half-up rounding, handles known malformed distance exports, compares source payout lines, and emits evidence. `agent.py` enforces the ₹200-per-rider-per-day PaySwift cap, never pays more than the confirmed shortfall, and treats untrusted instructions as data. SQLite stores traces, message deduplication, and pending work; the compose stack also starts Postgres for deployment parity and future migration.
+The parser does not determine how much money is owed. `calculator.py` owns the business rules, and `payswift.py` owns external payment calls.
 
-Endpoints: `GET /health`, `POST /messages`, `GET /trace/{rider_id}`, `GET /ops/pending`, and the lightweight ops page `GET /ops`; ops decisions use `POST /ops/pending/{id}` with `{"decision":"approved"}` or `rejected`. Example request:
+## API
+
+```http
+POST /messages
+Content-Type: application/json
+```
 
 ```json
-{"message_id":"wamid.demo","rider_id":"R003","text":"order T926334 ka surge nahi mila","received_at":"2026-09-22T09:05:00+05:30"}
+{
+  "message_id": "wamid.demo",
+  "rider_id": "R003",
+  "text": "order T926334 ka surge nahi mila",
+  "received_at": "2026-09-22T09:05:00+05:30"
+}
 ```
 
-The response contains `{"reply":"..."}`. Ops pending items contain approval amounts or escalation reasons. Every inbound message, parsed decision, investigation tool call, and outbound reply is traceable without logging secrets.
+The response is `{"reply":"..."}`. Other endpoints are:
 
-## Assumptions and limitations
+- `GET /health` — readiness check.
+- `GET /trace/{rider_id}` — ordered messages, decisions, tool calls, and replies.
+- `GET /ops/pending` — pending approvals and escalations as JSON.
+- `GET /ops` — simple operations view.
+- `POST /ops/pending/{id}` — approve or reject a pending item.
 
-The supplied CSV exports are the local system of record for historical reconciliation; PaySwift is the authority for newly issued corrections. No paid LLM is required: this deliberately narrow parser is reliable for the provided evaluation vocabulary and is replaceable behind `parse_complaint` if a production classifier is introduced. Postgres is provisioned by Compose, while the current implementation uses SQLite to keep the take-home self-contained. The evaluator script is a smoke/content report; financial assertions are covered in unit tests and should be expanded with a live PaySwift integration harness.
+## Run locally
 
-## AI session logs
+Python 3.11+ is recommended.
 
-`ai-logs/` contains the assignment-provided instructions only. Genuine raw Codex session exports were not automatically available to this workspace; before submission, export the actual session JSONL from the Codex session directory and place it there. Do not fabricate logs or include secrets.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+Configuration is read from environment variables listed in `.env.example`. `PAYSWIFT_BASE_URL` defaults to `http://localhost:8081`.
+
+## Run with Docker
+
+```bash
+docker compose up --build
+```
+
+This starts the application, the PaySwift sandbox, and Postgres. The application is available at `http://localhost:8000`.
+
+## Tests and evaluation
+
+```bash
+pytest -q
+python evals/run.py http://localhost:8000
+```
+
+The tests cover policy calculations, incentives, authorization, prompt-injection handling, and idempotency. The supplied 24 conversation examples were also checked against their expected payout and approval totals.
+
+## Project structure
+
+```text
+app/       service, workflow, parser, calculations, PaySwift client, and storage
+data/      assignment exports and sample conversations
+docs/      payout policy
+evals/     interface-level evaluator
+tests/     automated tests
+payswift/  unchanged assignment sandbox
+```
+
+## Design decisions and limitations
+
+The service does not require a paid LLM. This keeps the business-critical path deterministic and the tests repeatable. A model could be added behind `parser.py`, but it should remain limited to extracting structured complaint details and should never authorize tools or payments.
+
+CSV exports are used for historical reconciliation, while PaySwift is the authority for newly issued corrections. SQLite keeps this take-home self-contained; Postgres is included in Compose for a straightforward future migration.
+
+The operations page has no authentication. A production deployment would put it behind the company's identity provider and role-based access control. The parser is tuned to the supplied English/Hinglish examples rather than being a general multilingual model.
+
+## AI session records
+
+`ai-logs/` is reserved for genuine raw session exports. No conversations or tool logs are fabricated. Export the actual Codex session JSONL into that directory before submission if required by the assignment.
 
 ## Submission
 
-This directory is separate from the cloned read-only reference at `../original-assignment`. Create a private GitHub repository, add this directory as its contents, push `main`, then add `Sarthak-pyard` as a collaborator only after explicitly authorizing that GitHub action. Do not make the repository public.
+The original assignment repository was kept separate and unchanged. Keep this GitHub repository private as required by the assignment and add `Sarthak-pyard` as a collaborator only when ready to submit.
