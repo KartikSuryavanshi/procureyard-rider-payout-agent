@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      PAYSWIFT_BASE_URL: http://payswift:8081
+      DATA_DIR: /app/data
+      DB_PATH: /app/runtime/desk.db
+    volumes: ["app_runtime:/app/runtime"]
+    depends_on:
+      payswift: {condition: service_healthy}
+      postgres: {condition: service_started}
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: quickdrop
+      POSTGRES_PASSWORD: quickdrop
+      POSTGRES_DB: quickdrop
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+  payswift:
+    build: ./payswift
+    ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+volumes:
+  app_runtime:
+  pg_data:

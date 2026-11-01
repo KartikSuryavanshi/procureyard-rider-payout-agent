@@ -1,0 +1,6 @@
+.env
+.git
+runtime
+tests
+evals
+ai-logs/*.jsonl
